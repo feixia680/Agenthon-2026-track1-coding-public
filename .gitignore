@@ -26,6 +26,8 @@ env/
 # Local scratch
 *.log
 /out/
+/local-output/
+/local-smoke/
 
 # Safety: never commit the proprietary, local-only folder (it lives outside repos anyway)
 proprietary-DO-NOT-PUSH/
