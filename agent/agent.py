@@ -10,6 +10,8 @@ import sys
 
 from openai import OpenAI
 from profiler import profile_inputs
+from artifact import inspect_artifacts
+from verifier import verify_artifacts
 
 
 RESERVED_OUTPUTS = {"reward.json", "pytest_report.json", "reward.txt"}
@@ -18,22 +20,20 @@ RESERVED_OUTPUTS = {"reward.json", "pytest_report.json", "reward.txt"}
 def _strip_code_fence(text: str) -> str:
     text = text.strip()
     m = re.search(r"```(?:python|py)?\s*\n?(.*?)```", text, re.DOTALL | re.I)
-    if m:
-        return m.group(1).strip()
-    return text
+    return m.group(1).strip() if m else text
 
 
-def _expected_output_names(instruction: str) -> list[str]:
+def _expected_output_names(instruction: str):
     names = re.findall(r"(?:/app)?/output/([A-Za-z0-9_.-]+)", instruction)
     return sorted({x for x in names if x not in RESERVED_OUTPUTS})
 
 
-def _run_solution(script: pathlib.Path, output_dir: pathlib.Path):
+def _run_solution(script: pathlib.Path, output: pathlib.Path):
     timeout = int(os.environ.get("AGENT_SOLUTION_TIMEOUT_SEC", "1500"))
     try:
         r = subprocess.run(
             [sys.executable, str(script)],
-            cwd=output_dir,
+            cwd=output,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -49,83 +49,82 @@ def solve(task_dir: str, out_dir: str):
     output.mkdir(parents=True, exist_ok=True)
 
     instruction = (task / "instruction.md").read_text(encoding="utf-8")
-    data_profile = profile_inputs(task)
+    profile = profile_inputs(task)
 
-    endpoint = os.environ.get("MODEL_ENDPOINT")
-    model = os.environ.get("MODEL_NAME")
-    if not endpoint or not model:
-        raise RuntimeError("MODEL_ENDPOINT and MODEL_NAME must be set")
+    client = OpenAI(
+        base_url=os.environ["MODEL_ENDPOINT"],
+        api_key=os.environ.get("MODEL_API_KEY", "unused"),
+    )
+    model = os.environ["MODEL_NAME"]
 
-    client = OpenAI(base_url=endpoint, api_key=os.environ.get("MODEL_API_KEY", "unused"))
-
-    base_prompt = f"""
+    prompt = f"""
 You are a quantitative finance coding agent.
 
-You must produce a complete executable Python program.
-Use the observed input profile below. Never guess columns or keys.
-Do not access checks, card.toml, manifest.json, or hidden verifier data.
+Generate a complete executable Python program.
+Use the observed input profile. Never guess schema.
+Do not access hidden checks, card.toml, or manifest.json.
 Do not create reward.json, pytest_report.json or reward.txt.
 Only write requested deliverables.
 
 INPUT PROFILE:
-{data_profile}
+{profile}
 
 TASK:
 {instruction}
 
-Return only Python source code.
+Return only Python source.
 """
 
     expected = _expected_output_names(instruction)
     script = pathlib.Path("/tmp/qf_agent_solution.py")
-    max_repairs = int(os.environ.get("AGENT_MAX_REPAIRS", "2"))
     code = ""
-    last_error = ""
+    error = ""
 
-    for attempt in range(max_repairs + 1):
+    for attempt in range(int(os.environ.get("AGENT_MAX_REPAIRS", "2")) + 1):
         if attempt == 0:
             messages = [
                 {"role": "system", "content": "Write robust executable Python."},
-                {"role": "user", "content": base_prompt},
+                {"role": "user", "content": prompt},
             ]
         else:
             messages = [
-                {"role": "system", "content": "Repair the program with minimum necessary changes."},
-                {"role": "user", "content": base_prompt + "\nPrevious code:\n" + code + "\nExecution feedback:\n" + last_error},
+                {"role": "system", "content": "Repair with minimum necessary changes."},
+                {"role": "user", "content": prompt + f"\nPrevious code:\n{code}\nExecution feedback:\n{error}"},
             ]
 
-        resp = client.chat.completions.create(
+        response = client.chat.completions.create(
             model=model,
             temperature=0,
             max_tokens=int(os.environ.get("MODEL_MAX_TOKENS", "12000")),
             messages=messages,
         )
-        code = _strip_code_fence(resp.choices[0].message.content or "")
+
+        code = _strip_code_fence(response.choices[0].message.content or "")
         script.write_text(code + "\n", encoding="utf-8")
 
         for name in expected:
             p = output / name
             if p.exists():
-                if p.is_dir():
-                    shutil.rmtree(p)
-                else:
-                    p.unlink()
+                p.unlink()
 
         rc, stdout, stderr = _run_solution(script, output)
         missing = [x for x in expected if not (output / x).is_file()]
 
-        if rc == 0 and not missing:
+        artifact_report = inspect_artifacts(output)
+        verification = verify_artifacts(instruction, artifact_report)
+
+        if rc == 0 and not missing and verification["passed"]:
             return
 
-        last_error = (
+        error = (
             f"return_code={rc}\n"
             f"missing={missing}\n"
             f"stdout={stdout}\n"
-            f"stderr={stderr}"
+            f"stderr={stderr}\n"
+            f"verification={verification}"
         )
 
-    print(last_error, file=sys.stderr)
-    raise RuntimeError("agent failed after repairs")
+    raise RuntimeError(error)
 
 
 def main():
